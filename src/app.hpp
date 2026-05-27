@@ -65,6 +65,7 @@ struct State {
     };
     int cursor_x = 0;
     int cursor_y = 0;
+    int agg_scroll = 0;
 
     // Autocomplete popup.
     bool                     ac_active = false;

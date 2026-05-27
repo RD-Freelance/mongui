@@ -1011,13 +1011,23 @@ int compute_hscroll(int line_len, int cursor_x, int avail) {
     return hscroll;
 }
 
-void render_agg_editor(const State& s, int x, int y, int w, int h) {
+void render_agg_editor(State& s, int x, int y, int w, int h) {
     const int line_no_w = 3;
     int avail = std::max(8, w - line_no_w);
 
-    for (int i = 0; i < (int)s.agg_lines.size() && i < h; ++i) {
-        const std::string& body = s.agg_lines[i];
-        int hscroll = (i == s.cursor_y)
+    // Keep cursor row in view.
+    int n = (int)s.agg_lines.size();
+    if (s.cursor_y < s.agg_scroll)         s.agg_scroll = s.cursor_y;
+    if (s.cursor_y >= s.agg_scroll + h)    s.agg_scroll = s.cursor_y - h + 1;
+    int max_scroll = std::max(0, n - h);
+    if (s.agg_scroll > max_scroll)         s.agg_scroll = max_scroll;
+    if (s.agg_scroll < 0)                  s.agg_scroll = 0;
+
+    for (int i = 0; i < h; ++i) {
+        int idx = i + s.agg_scroll;
+        if (idx >= n) break;
+        const std::string& body = s.agg_lines[idx];
+        int hscroll = (idx == s.cursor_y)
             ? compute_hscroll((int)body.size(), s.cursor_x, avail) : 0;
 
         int start = std::min((int)body.size(), hscroll);
@@ -1032,7 +1042,7 @@ void render_agg_editor(const State& s, int x, int y, int w, int h) {
         if (more_left && !visible.empty())  visible.erase(0, 1);
         if (more_right && !visible.empty()) visible.pop_back();
 
-        char buf[8]; std::snprintf(buf, sizeof(buf), "%2d ", i + 1);
+        char buf[8]; std::snprintf(buf, sizeof(buf), "%2d ", idx + 1);
         std::string out;
         out.append(Colors::dgray).append(buf).append(Colors::reset);
 
@@ -1041,6 +1051,18 @@ void render_agg_editor(const State& s, int x, int y, int w, int h) {
         if (more_right) out.append(Colors::dgray).append("›").append(Colors::reset);
 
         term::line(x, y + i, out);
+    }
+
+    // Vertical scroll indicator on the right edge of the editor.
+    if (max_scroll > 0) {
+        int gh = std::max(1, h * h / std::max(1, n));
+        int gy = (h - gh) * s.agg_scroll / max_scroll;
+        for (int i = 0; i < h; ++i) {
+            const char* glyph = (i >= gy && i < gy + gh) ? "▐" : " ";
+            const char* col   = (i >= gy && i < gy + gh) ? Colors::green : Colors::dgray;
+            std::string g; g.append(col).append(glyph).append(Colors::reset);
+            term::line(x + w - 1, y + i, g);
+        }
     }
 }
 
@@ -1057,7 +1079,8 @@ int draw_agg_cursor(const State& s, int base_col_at_zero, int editor_y0, int ava
     // hscroll>0; account for that so the cursor lands on the right cell.
     int extra = (hscroll > 0) ? 1 : 0;
     int screen_x = base_col_at_zero + extra + (cx_off - hscroll);
-    render_block_cursor(screen_x, editor_y0 + cy_idx, ln, cx_off);
+    int screen_y = editor_y0 + (cy_idx - s.agg_scroll);
+    render_block_cursor(screen_x, screen_y, ln, cx_off);
     return base_col_at_zero + extra - hscroll;
 }
 
@@ -1074,7 +1097,7 @@ void render_agg_wide(State& s) {
 
     int avail = std::max(8, (LEFT - 4) - 3);
     int ac_base = draw_agg_cursor(s, /*base_col_at_zero=*/6, /*editor_y0=*/5, avail);
-    ac_render(s, LEFT, 4, ac_base);
+    ac_render(s, LEFT, 4 - s.agg_scroll, ac_base);
 }
 
 void render_agg_stack(State& s) {
@@ -1090,7 +1113,7 @@ void render_agg_stack(State& s) {
 
     int avail = std::max(8, (W - 4) - 3);
     int ac_base = draw_agg_cursor(s, /*base_col_at_zero=*/6, /*editor_y0=*/5, avail);
-    ac_render(s, W, 4, ac_base);
+    ac_render(s, W, 4 - s.agg_scroll, ac_base);
 }
 
 // ---------- SHELL ----------
