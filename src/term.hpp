@@ -64,8 +64,10 @@ std::string fkey(const std::string& k, const std::string& label);
 // Draws a titled box with bordered interior. Active = leaf-green; inactive = dim.
 void box(int x, int y, int w, int h, const std::string& title, bool active);
 
-// One query-bar input row (filter/project/sort/skip/limit).
-void qfield(int x, int y, const std::string& label,
+// One query-bar input row (filter/project/sort/skip/limit). `w` is the
+// total column width the field is allowed to occupy; the value is
+// truncated (or scrolled, when focused) so it never exceeds it.
+void qfield(int x, int y, int w, const std::string& label,
             const std::string& val, bool focused);
 
 } // namespace term

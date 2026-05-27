@@ -337,18 +337,39 @@ void box(int x, int y, int w, int h, const std::string& title, bool active) {
     line(x, y + h - 1, bot);
 }
 
-void qfield(int x, int y, const std::string& label,
+void qfield(int x, int y, int w, const std::string& label,
             const std::string& val, bool focused) {
     const char* lc    = focused ? Colors::green_b : Colors::gray;
     std::string caret = focused ? (std::string(Colors::bg_green) + " " + Colors::reset)
                                 : std::string();
 
+    // Prefix occupies "label  ▸ " = 7 (padded label) + " ▸ " (3 cols) = 10 cols.
+    constexpr int prefix_w = 10;
+    int avail = std::max(0, w - prefix_w);
+
     std::string body;
     if (val.empty()) {
-        body = focused ? caret : (std::string(Colors::dgray) + "(optional)" + Colors::reset);
+        if (focused) {
+            body = caret;
+        } else {
+            std::string ph = "(optional)";
+            if ((int)ph.size() > avail)
+                ph = avail > 0 ? ph.substr(0, avail - 1) + "…" : std::string();
+            body.append(Colors::dgray).append(ph).append(Colors::reset);
+        }
+    } else if (focused) {
+        // Reserve a column for the caret and scroll-window the value so the
+        // cursor stays visible while typing past the right edge.
+        int val_w = std::max(0, avail - 1);
+        std::string shown = (int)val.size() > val_w
+                              ? val.substr(val.size() - val_w)
+                              : val;
+        body = highlight(shown) + caret;
     } else {
-        body = focused ? (highlight(val) + caret)
-                       : (std::string(Colors::yellow) + val + Colors::reset);
+        std::string shown = val;
+        if ((int)shown.size() > avail)
+            shown = avail > 0 ? shown.substr(0, avail - 1) + "…" : std::string();
+        body.append(Colors::yellow).append(shown).append(Colors::reset);
     }
 
     char lab[16];

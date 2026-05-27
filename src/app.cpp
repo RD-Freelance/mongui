@@ -948,11 +948,12 @@ void render_query_wide(State& s) {
     }
 
     int QX = DOC_X + 2;
-    term::qfield(QX, 4, "filter",  s.query,     s.q_focus == 1);
-    term::qfield(QX, 5, "project", s.q_project, s.q_focus == 2);
-    term::qfield(QX, 6, "sort",    s.q_sort,    s.q_focus == 3);
-    term::qfield(QX, 7, "skip",    s.q_skip,    s.q_focus == 4);
-    term::qfield(QX, 8, "limit",   s.q_limit,   s.q_focus == 5);
+    int QW = std::max(0, DOC_W - 4);
+    term::qfield(QX, 4, QW, "filter",  s.query,     s.q_focus == 1);
+    term::qfield(QX, 5, QW, "project", s.q_project, s.q_focus == 2);
+    term::qfield(QX, 6, QW, "sort",    s.q_sort,    s.q_focus == 3);
+    term::qfield(QX, 7, QW, "skip",    s.q_skip,    s.q_focus == 4);
+    term::qfield(QX, 8, QW, "limit",   s.q_limit,   s.q_focus == 5);
     rule(QX, 9, DOC_W - 4);
 
     render_doc_pane(s.docs, QX, 10, DOC_W - 2, H - 8, s.doc_scroll);
@@ -978,15 +979,18 @@ void render_query_stack(State& s) {
     // Compact query fields — single-line layout if width allows.
     int qy = 6;
     rule(2, qy, W - 4);
-    term::qfield(3, qy + 1, "filter",  s.query,     s.q_focus == 1);
-    term::qfield(3, qy + 2, "project", s.q_project, s.q_focus == 2);
-    term::qfield(3, qy + 3, "sort",    s.q_sort,    s.q_focus == 3);
+    int full_w = std::max(0, W - 6);
+    int half_w = std::max(0, W / 2 - 4);
+    int top_w  = (W >= 70) ? half_w : full_w;
+    term::qfield(3, qy + 1, top_w,  "filter",  s.query,     s.q_focus == 1);
+    term::qfield(3, qy + 2, top_w,  "project", s.q_project, s.q_focus == 2);
+    term::qfield(3, qy + 3, full_w, "sort",    s.q_sort,    s.q_focus == 3);
     if (W >= 70) {
-        term::qfield(3 + W / 2, qy + 1, "skip",  s.q_skip,  s.q_focus == 4);
-        term::qfield(3 + W / 2, qy + 2, "limit", s.q_limit, s.q_focus == 5);
+        term::qfield(3 + W / 2, qy + 1, half_w, "skip",  s.q_skip,  s.q_focus == 4);
+        term::qfield(3 + W / 2, qy + 2, half_w, "limit", s.q_limit, s.q_focus == 5);
     } else {
-        term::qfield(3, qy + 4, "skip",  s.q_skip,  s.q_focus == 4);
-        term::qfield(3, qy + 5, "limit", s.q_limit, s.q_focus == 5);
+        term::qfield(3, qy + 4, full_w, "skip",  s.q_skip,  s.q_focus == 4);
+        term::qfield(3, qy + 5, full_w, "limit", s.q_limit, s.q_focus == 5);
         qy += 2;
     }
 
