@@ -1,5 +1,6 @@
 # Mongui
 
+
 > A keyboard-driven MongoDB terminal client written in C++17.
 > By **RD-Freelance** · MIT licensed · [LICENSE](LICENSE)
 
