@@ -16,6 +16,25 @@ struct QueryResult {
     std::vector<std::string> lines; // display lines (split per document, blank line separators)
     int64_t total = 0;              // total matching/produced
     int     shown = 0;              // documents rendered into `lines`
+    // Parallel per-document data (size == shown) for find results. `raw[i]` is
+    // the i-th document's pretty JSON (round-trips through relax_bson); `ids[i]`
+    // is a canonical `{ "_id": … }` selector for delete/replace. Empty for docs
+    // without an _id (e.g. some aggregation output).
+    std::vector<std::string> raw;
+    std::vector<std::string> ids;
+};
+
+// Result of a single-document write (delete/replace/clone).
+struct WriteResult {
+    bool        ok = false;
+    std::string message;            // human-readable status (✔ / ⚠)
+};
+
+// Result of a bulk import from a file.
+struct ImportResult {
+    bool        ok = false;
+    long long   inserted = 0;       // documents successfully inserted
+    std::string message;            // human-readable status (✔ / ⚠)
 };
 
 struct ExportResult {
@@ -56,6 +75,24 @@ QueryResult run_aggregation(const std::string& db, const std::string& col,
 
 // Parse and run a mongosh-style `db.coll.method(...)` command.
 QueryResult run_shell(const std::string& db, const std::string& cmd);
+
+// Single-document writes used by the per-document actions in the documents
+// pane. `selector_json` is a canonical `{ "_id": … }` produced by run_find;
+// `doc_text` is relaxed/display JSON (passed through relax_bson internally).
+WriteResult delete_doc (const std::string& db, const std::string& col,
+                        const std::string& selector_json);
+WriteResult replace_doc(const std::string& db, const std::string& col,
+                        const std::string& selector_json,
+                        const std::string& doc_text);
+WriteResult clone_doc  (const std::string& db, const std::string& col,
+                        const std::string& doc_text);  // inserts a copy, sans _id
+
+// Bulk-import documents from a file into db.col. Accepts a JSON array
+// (`[ {…}, {…} ]`), newline-delimited / concatenated JSON objects (NDJSON),
+// or a single object. Relaxed/mongosh JSON (ObjectId(...), unquoted keys) is
+// accepted. Inserts in batches; partial progress is reported in `inserted`.
+ImportResult import_documents(const std::string& db, const std::string& col,
+                              const std::string& filepath);
 
 // Count documents matching `filter`. -1 on error (with `error_out` set).
 int64_t count_documents(const std::string& db, const std::string& col,

@@ -25,6 +25,15 @@ namespace mongodb {
 
 namespace {
 
+// Portable UTC breakdown: gmtime_r on POSIX, gmtime_s on the Windows CRT.
+inline void gmtime_utc(const std::time_t* t, std::tm* out) {
+#ifdef _WIN32
+    gmtime_s(out, t);
+#else
+    gmtime_r(t, out);
+#endif
+}
+
 // =========================================================
 // DRIVER STATE
 // =========================================================
@@ -102,7 +111,7 @@ std::string fmt_date(int64_t ms) {
     if (rem < 0) { rem += 1000; sec -= 1; }
     std::time_t t = (std::time_t)sec;
     std::tm tm_utc{};
-    gmtime_r(&t, &tm_utc);
+    gmtime_utc(&t, &tm_utc);
     char buf[40];
     std::snprintf(buf, sizeof(buf),
         "ISODate(\"%04d-%02d-%02dT%02d:%02d:%02d.%03dZ\")",
@@ -317,7 +326,7 @@ std::string csv_value(bson_iter_t* it) {
             int rem = (int)(ms - sec * 1000);
             std::time_t t2 = (std::time_t)sec;
             std::tm tm_utc{};
-            gmtime_r(&t2, &tm_utc);
+            gmtime_utc(&t2, &tm_utc);
             std::snprintf(buf, sizeof(buf),
                 "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
                 tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
@@ -660,11 +669,32 @@ std::string expand_ctors(const std::string& s) {
     return out;
 }
 
+// Build a canonical `{ "_id": <value> }` selector for `doc`. Canonical
+// extended JSON preserves the exact BSON type so the selector round-trips
+// back through bson_new_from_json. Returns "" if the doc has no _id.
+std::string make_id_selector(const bson_t* doc) {
+    bson_iter_t it;
+    if (!bson_iter_init_find(&it, doc, "_id")) return std::string();
+    bson_t sel;
+    bson_init(&sel);
+    bson_append_value(&sel, "_id", 3, bson_iter_value(&it));
+    size_t len = 0;
+    char* js = bson_as_canonical_extended_json(&sel, &len);
+    std::string out = js ? std::string(js, len) : std::string();
+    if (js) bson_free(js);
+    bson_destroy(&sel);
+    return out;
+}
+
 // =========================================================
 // CURSOR DRAIN -> display lines
 // =========================================================
+// When `raw`/`ids` are non-null they receive one entry per *shown* document:
+// the pretty JSON block (for copy/clone/edit) and the canonical _id selector.
 void drain_cursor(mongoc_cursor_t* cursor, int display_limit, bool count_all,
-                  std::vector<std::string>& docs, int64_t& total, int& shown) {
+                  std::vector<std::string>& docs, int64_t& total, int& shown,
+                  std::vector<std::string>* raw = nullptr,
+                  std::vector<std::string>* ids = nullptr) {
     total = 0; shown = 0;
     const bson_t* doc = nullptr;
     while (mongoc_cursor_next(cursor, &doc)) {
@@ -672,6 +702,15 @@ void drain_cursor(mongoc_cursor_t* cursor, int display_limit, bool count_all,
         if (shown < display_limit) {
             if (shown > 0) docs.push_back("");
             auto lines = format_doc(doc);
+            if (raw) {
+                std::string joined;
+                for (size_t i = 0; i < lines.size(); ++i) {
+                    if (i) joined.push_back('\n');
+                    joined += lines[i];
+                }
+                raw->push_back(std::move(joined));
+            }
+            if (ids) ids->push_back(make_id_selector(doc));
             for (auto& l : lines) docs.push_back(std::move(l));
             ++shown;
         } else if (!count_all) {
@@ -821,7 +860,7 @@ std::string export_path(const std::string& db, const std::string& col,
 
     std::time_t t = std::time(nullptr);
     std::tm utc{};
-    gmtime_r(&t, &utc);
+    gmtime_utc(&t, &utc);
     char ts[32];
     std::snprintf(ts, sizeof(ts), "%04d%02d%02dT%02d%02d%02dZ",
         utc.tm_year + 1900, utc.tm_mon + 1, utc.tm_mday,
@@ -838,8 +877,14 @@ std::string export_path(const std::string& db, const std::string& col,
 // =========================================================
 // PUBLIC: lifecycle
 // =========================================================
+// Swallow libmongoc's legacy log stream (connection-monitor DEBUG chatter,
+// etc.). mongui surfaces its own errors via return values, and stray stderr
+// writes would corrupt the TUI and clutter the --import output.
+void quiet_log_handler(mongoc_log_level_t, const char*, const char*, void*) {}
+
 bool init() {
     mongoc_init();
+    mongoc_log_set_handler(quiet_log_handler, nullptr);
     return true;
 }
 
@@ -986,7 +1031,8 @@ QueryResult run_find(const std::string& db, const std::string& col,
         mongoc_collection_find_with_opts(c, bf, bopts, nullptr);
 
     int64_t total = 0; int shown = 0;
-    drain_cursor(cur, display_limit, opts.has_limit, result.lines, total, shown);
+    drain_cursor(cur, display_limit, opts.has_limit, result.lines, total, shown,
+                 &result.raw, &result.ids);
     result.shown = shown;
 
     if (opts.has_limit) {
@@ -1403,6 +1449,200 @@ QueryResult run_shell(const std::string& db, const std::string& cmd) {
     return result;
 }
 
+// =========================================================
+// PUBLIC: single-document writes (documents-pane actions)
+// =========================================================
+namespace {
+
+// Read an integer field (deletedCount / modifiedCount …) out of a write reply.
+int64_t reply_count(const bson_t* reply, const char* key) {
+    bson_iter_t it;
+    if (bson_iter_init_find(&it, reply, key)) return bson_iter_as_int64(&it);
+    return -1;
+}
+
+// Common preamble: open a pooled client and the target collection. Returns
+// nullptr (with `err` set on the result) when unavailable.
+mongoc_collection_t* open_coll(PooledClient& pc, const std::string& db,
+                               const std::string& col, WriteResult& out) {
+    if (db.empty() || col.empty()) { out.message = "⚠ No collection selected"; return nullptr; }
+    if (!pc)                       { out.message = "⚠ not connected";          return nullptr; }
+    return mongoc_client_get_collection(pc.get(), db.c_str(), col.c_str());
+}
+
+} // anonymous
+
+WriteResult delete_doc(const std::string& db, const std::string& col,
+                       const std::string& selector_json) {
+    WriteResult out;
+    PooledClient pc;
+    mongoc_collection_t* c = open_coll(pc, db, col, out);
+    if (!c) return out;
+
+    bson_t* sel = bson_new_from_json(
+        (const uint8_t*)selector_json.data(), (ssize_t)selector_json.size(), &g_err);
+    if (!sel) { out.message = std::string("⚠ bad selector: ") + last_error();
+                mongoc_collection_destroy(c); return out; }
+
+    bson_t reply;
+    out.ok = mongoc_collection_delete_one(c, sel, nullptr, &reply, &g_err);
+    if (out.ok) {
+        int64_t n = reply_count(&reply, "deletedCount");
+        out.message = "✔ deleted " + std::to_string(n < 0 ? 1 : n) + " document";
+    } else {
+        out.message = std::string("⚠ ") + last_error();
+    }
+    bson_destroy(&reply);
+    bson_destroy(sel);
+    mongoc_collection_destroy(c);
+    return out;
+}
+
+WriteResult replace_doc(const std::string& db, const std::string& col,
+                        const std::string& selector_json,
+                        const std::string& doc_text) {
+    WriteResult out;
+    PooledClient pc;
+    mongoc_collection_t* c = open_coll(pc, db, col, out);
+    if (!c) return out;
+
+    bson_t* sel = bson_new_from_json(
+        (const uint8_t*)selector_json.data(), (ssize_t)selector_json.size(), &g_err);
+    std::string strict = relax_bson(doc_text);
+    bson_t* doc = bson_new_from_json(
+        (const uint8_t*)strict.data(), (ssize_t)strict.size(), &g_err);
+    if (!sel || !doc) {
+        out.message = std::string("⚠ ") + last_error();
+        if (sel) bson_destroy(sel);
+        if (doc) bson_destroy(doc);
+        mongoc_collection_destroy(c);
+        return out;
+    }
+
+    bson_t reply;
+    out.ok = mongoc_collection_replace_one(c, sel, doc, nullptr, &reply, &g_err);
+    out.message = out.ok ? "✔ document updated"
+                         : (std::string("⚠ ") + last_error());
+    bson_destroy(&reply);
+    bson_destroy(sel);
+    bson_destroy(doc);
+    mongoc_collection_destroy(c);
+    return out;
+}
+
+WriteResult clone_doc(const std::string& db, const std::string& col,
+                      const std::string& doc_text) {
+    WriteResult out;
+    PooledClient pc;
+    mongoc_collection_t* c = open_coll(pc, db, col, out);
+    if (!c) return out;
+
+    std::string strict = relax_bson(doc_text);
+    bson_t* src = bson_new_from_json(
+        (const uint8_t*)strict.data(), (ssize_t)strict.size(), &g_err);
+    if (!src) { out.message = std::string("⚠ ") + last_error();
+                mongoc_collection_destroy(c); return out; }
+
+    // Copy every field except _id so the server mints a fresh id for the clone.
+    bson_t doc;
+    bson_init(&doc);
+    bson_iter_t it;
+    if (bson_iter_init(&it, src)) {
+        while (bson_iter_next(&it)) {
+            if (std::strcmp(bson_iter_key(&it), "_id") == 0) continue;
+            bson_append_value(&doc, bson_iter_key(&it), -1, bson_iter_value(&it));
+        }
+    }
+
+    bson_t reply;
+    out.ok = mongoc_collection_insert_one(c, &doc, nullptr, &reply, &g_err);
+    out.message = out.ok ? "✔ cloned document"
+                         : (std::string("⚠ ") + last_error());
+    bson_destroy(&reply);
+    bson_destroy(&doc);
+    bson_destroy(src);
+    mongoc_collection_destroy(c);
+    return out;
+}
+
+// =========================================================
+// PUBLIC: bulk import from a file
+// =========================================================
+ImportResult import_documents(const std::string& db, const std::string& col,
+                              const std::string& filepath) {
+    ImportResult out;
+    if (db.empty() || col.empty()) {
+        out.message = "⚠ need both a database and a collection"; return out;
+    }
+
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f) { out.message = std::string("⚠ cannot open file: ") + filepath; return out; }
+    std::ostringstream ss; ss << f.rdbuf();
+    std::string content = ss.str();
+    if (trim(content).empty()) { out.message = "⚠ file is empty"; return out; }
+
+    PooledClient pc;
+    if (!pc) { out.message = "⚠ not connected"; return out; }
+    mongoc_collection_t* c =
+        mongoc_client_get_collection(pc.get(), db.c_str(), col.c_str());
+
+    std::vector<bson_t*> batch;
+    auto flush_batch = [&]() -> bool {
+        if (batch.empty()) return true;
+        std::vector<const bson_t*> arr(batch.begin(), batch.end());
+        bson_t reply;
+        bool ok = mongoc_collection_insert_many(
+            c, arr.data(), arr.size(), nullptr, &reply, &g_err);
+        bson_destroy(&reply);
+        if (ok) out.inserted += (long long)batch.size();
+        for (bson_t* b : batch) bson_destroy(b);
+        batch.clear();
+        return ok;
+    };
+
+    bool ok = true;
+    std::string trimmed = trim(content);
+
+    if (trimmed.front() == '[') {
+        // JSON array: strip the outer brackets, split top-level elements.
+        std::string body = trimmed.substr(1, trimmed.size() - 2);
+        for (auto& e : split_args(body)) {
+            if (trim(e).empty()) continue;
+            std::string strict = relax_bson(e);
+            bson_t* d = bson_new_from_json(
+                (const uint8_t*)strict.data(), (ssize_t)strict.size(), &g_err);
+            if (!d) { ok = false; out.message = std::string("⚠ parse error: ") + last_error(); break; }
+            batch.push_back(d);
+            if (batch.size() >= 1000 && !flush_batch()) { ok = false; break; }
+        }
+    } else {
+        // NDJSON / concatenated / single object: stream documents out of the
+        // relaxed text with libbson's JSON reader (handles multi-line objects).
+        std::string strict = relax_bson(content);
+        bson_json_reader_t* r = bson_json_data_reader_new(true, 4096);
+        bson_json_data_reader_ingest(r, (const uint8_t*)strict.data(), strict.size());
+        bson_t doc = BSON_INITIALIZER;
+        int rc;
+        while ((rc = bson_json_reader_read(r, &doc, &g_err)) == 1) {
+            batch.push_back(bson_copy(&doc));
+            bson_reinit(&doc);
+            if (batch.size() >= 1000 && !flush_batch()) { ok = false; break; }
+        }
+        if (rc < 0) { ok = false; out.message = std::string("⚠ parse error: ") + last_error(); }
+        bson_destroy(&doc);
+        bson_json_reader_destroy(r);
+    }
+
+    // Flush whatever parsed cleanly (even on a later error, keep good docs).
+    if (!flush_batch() && ok) { ok = false; out.message = std::string("⚠ insert failed: ") + last_error(); }
+
+    mongoc_collection_destroy(c);
+    out.ok = ok;
+    if (out.message.empty())
+        out.message = (ok ? "✔ imported " : "⚠ imported ") +
+                      std::to_string(out.inserted) + " document(s)";
+    return out;
+}
 
 int64_t count_documents(const std::string& db, const std::string& col,
                         const std::string& filter, std::string& error_out) {

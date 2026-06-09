@@ -11,6 +11,7 @@ namespace term {
 struct Colors {
     static constexpr const char* reset    = "\x1b[0m";
     static constexpr const char* bold     = "\x1b[1m";
+    static constexpr const char* reverse  = "\x1b[7m";
     static constexpr const char* dim      = "\x1b[2m";
     static constexpr const char* black    = "\x1b[30m";
     static constexpr const char* white    = "\x1b[97m";
@@ -68,6 +69,7 @@ void box(int x, int y, int w, int h, const std::string& title, bool active);
 // total column width the field is allowed to occupy; the value is
 // truncated (or scrolled, when focused) so it never exceeds it.
 void qfield(int x, int y, int w, const std::string& label,
-            const std::string& val, bool focused);
+            const std::string& val, bool focused, int cursor = -1,
+            const std::string& placeholder = "(optional)");
 
 } // namespace term

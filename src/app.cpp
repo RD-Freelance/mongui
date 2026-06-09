@@ -12,6 +12,15 @@
 #include <string>
 #include <vector>
 
+// popen/pclose are spelled with an underscore in the Windows CRT.
+#ifdef _WIN32
+#  define MONGUI_POPEN  _popen
+#  define MONGUI_PCLOSE _pclose
+#else
+#  define MONGUI_POPEN  popen
+#  define MONGUI_PCLOSE pclose
+#endif
+
 namespace app {
 
 namespace {
@@ -21,6 +30,10 @@ using term::Colors;
 const std::string Q_FIELDS[5] = {
     "query", "q_project", "q_sort", "q_skip", "q_limit"
 };
+
+// q_focus values: 0 = db/collection nav, 1..5 = editing a query field,
+// 6 = documents pane (per-document selection + actions).
+constexpr int DOC_FOCUS = 6;
 
 std::string* q_field_ptr(State& s, int focus) {
     switch (focus) {
@@ -743,7 +756,44 @@ const char* mode_label(mongodb::ViewMode m) {
     }
 }
 
-// Render the breadcrumb + mode badge at row 1, separator at row 2.
+// Label shown on a tab chip: the tab's selected collection (or db if none).
+std::string tab_label(State& s, int i) {
+    std::string db, col;
+    if (i == s.tab_i) {
+        db  = s.dbs.empty()      ? std::string("—") : s.dbs[s.db_i];
+        col = s.filtered.empty() ? std::string()    : s.filtered[s.col_i];
+    } else {
+        const Tab& t = s.tabs[i];
+        db  = (!s.dbs.empty() && t.db_i < (int)s.dbs.size()) ? s.dbs[t.db_i] : std::string("—");
+        col = t.filtered.empty() ? std::string() : t.filtered[t.col_i];
+    }
+    std::string label = col.empty() ? db : col;
+    if ((int)label.size() > 16) label = label.substr(0, 15) + "…";
+    return label;
+}
+
+// Tab bar at row 1: one chip per workspace tab, active one highlighted.
+void render_tabs(State& s) {
+    int W = term::W;
+    int x = 10;
+    int limit = W - 16;   // leave room for the mode badge on the right
+    for (int i = 0; i < (int)s.tabs.size(); ++i) {
+        std::string label = tab_label(s, i);
+        char idx[8]; std::snprintf(idx, sizeof(idx), "%d ", i + 1);
+        int vis = 1 + (int)std::strlen(idx) + (int)label.size() + 1;  // " N label "
+        if (x + vis > limit) break;
+        std::string chip;
+        if (i == s.tab_i)
+            chip.append(Colors::bg_sel).append(Colors::bold).append(Colors::white);
+        else
+            chip.append(Colors::gray);
+        chip.append(" ").append(idx).append(label).append(" ").append(Colors::reset);
+        term::line(x, 1, chip);
+        x += vis + 1;
+    }
+}
+
+// Render the tab bar + mode badge at row 1, separator at row 2.
 void render_header(State& s) {
     int W = term::W;
     rule(1, 2, W);
@@ -752,14 +802,7 @@ void render_header(State& s) {
     brand.append(Colors::green_b).append("mongui").append(Colors::reset);
     term::line(2, 1, brand);
 
-    std::string db  = !s.dbs.empty()     ? s.dbs[s.db_i] : std::string("—");
-    std::string col = !s.filtered.empty() ? s.filtered[s.col_i] : std::string("—");
-    std::string crumb;
-    crumb.append(Colors::dgray).append("  ·  ").append(Colors::reset)
-         .append(Colors::white).append(db).append(Colors::reset)
-         .append(Colors::dgray).append(" › ").append(Colors::reset)
-         .append(Colors::cyan).append(col).append(Colors::reset);
-    term::line(10, 1, crumb);
+    render_tabs(s);
 
     const char* lbl = mode_label(s.mode);
     int badge_w = (int)std::strlen(lbl) + 2;
@@ -798,6 +841,17 @@ void render_footer(State& s) {
               term::fkey("tab", "complete") + "  ";
     } else if (s.mode == mongodb::ViewMode::Shell) {
         mid = term::fkey("↵", "run") + "  ";
+    } else if (s.q_focus == DOC_FOCUS && s.edit_active) {
+        if (!s.edit_status.empty())
+            mid = std::string(Colors::red) + s.edit_status + Colors::reset + "   ";
+        mid += term::fkey("^s", "save") + "  " + term::fkey("esc", "cancel") + "  ";
+    } else if (s.q_focus == DOC_FOCUS) {
+        mid = term::fkey("tab", "field") + "  " +
+              term::fkey("j/k", "select") + "  " +
+              term::fkey("y", "copy") + "  " +
+              term::fkey("c", "clone") + "  " +
+              term::fkey("e", "edit") + "  " +
+              term::fkey("d", "delete") + "  ";
     } else {
         mid = term::fkey("tab", "field") + "  " +
               term::fkey("^f", "search") + "  " +
@@ -810,6 +864,7 @@ void render_footer(State& s) {
         term::fkey("^a", "agg") + "  " +
         term::fkey("^s", "shell") + "  " +
         mid +
+        term::fkey("^t/^b/^w", "tabs") + "  " +
         term::fkey("^j/^k", "scroll") + "  " +
         term::fkey("^o", "export") + "  " +
         term::fkey("^q", "quit");
@@ -890,6 +945,115 @@ void render_doc_pane(const std::vector<std::string>& docs,
     }
 }
 
+// Forward decls (defined later in this namespace).
+void render_block_cursor(int cx, int cy, const std::string& line, int col);
+int  compute_hscroll(int line_len, int cursor_x, int avail);
+
+// Documents pane with per-document selection AND inline editing. The selected
+// document is marked with a green gutter bar; when `edit_active`, that one
+// document is rendered *in place* as an editable buffer (yellow bar + block
+// cursor) instead of opening a separate popup.
+void render_doc_pane_sel(State& s, int x, int y, int w, int h) {
+    const std::vector<std::string>& docs = s.docs;
+    int  sel     = s.doc_sel;
+    bool focused = (s.q_focus == DOC_FOCUS);
+    bool editing = s.edit_active && focused;
+    int  avail   = std::max(8, w - 4);
+
+    // Split docs into per-document display-line groups (blank line = separator).
+    std::vector<std::vector<std::string>> groups;
+    {
+        std::vector<std::string> cur;
+        for (auto& l : docs) {
+            if (l.empty()) { groups.push_back(std::move(cur)); cur.clear(); }
+            else           { cur.push_back(l); }
+        }
+        groups.push_back(std::move(cur));
+    }
+
+    // Build display rows. `reln[i]` is the editor-line index when row i belongs
+    // to the document being edited inline, else -1; `rdoc[i]` is the doc index.
+    std::vector<std::string> rows;
+    std::vector<int>         rdoc, reln;
+    for (int d = 0; d < (int)groups.size(); ++d) {
+        if (d > 0) { rows.push_back(""); rdoc.push_back(-1); reln.push_back(-1); }
+        if (editing && d == sel) {
+            for (int el = 0; el < (int)s.edit_lines.size(); ++el) {
+                rows.push_back(s.edit_lines[el]); rdoc.push_back(d); reln.push_back(el);
+            }
+        } else {
+            for (auto& l : groups[d])
+                for (auto& c : wrap_line(l, avail)) {
+                    rows.push_back(std::move(c)); rdoc.push_back(d); reln.push_back(-1);
+                }
+        }
+    }
+
+    if (rows.empty()) {
+        std::string hint;
+        hint.append(Colors::dgray).append("(no results — press ↵ to run)").append(Colors::reset);
+        term::line(x, y, hint);
+        return;
+    }
+
+    // Keep the selection — or, while editing, the cursor line — in view.
+    int first = -1, focus_row = -1;
+    for (int i = 0; i < (int)rdoc.size(); ++i) {
+        if (rdoc[i] == sel) {
+            if (first < 0) first = i;
+            if (editing && reln[i] == s.edit_cy) focus_row = i;
+        }
+    }
+    if (focus_row < 0) focus_row = first;
+
+    int max_scroll = std::max(0, (int)rows.size() - h);
+    if (focused && focus_row >= 0) {
+        if (focus_row >= s.doc_scroll + h) s.doc_scroll = focus_row - h + 1;
+        if (focus_row < s.doc_scroll)      s.doc_scroll = focus_row;
+        if (!editing && first >= 0 && first < s.doc_scroll) s.doc_scroll = first;
+    }
+    if (s.doc_scroll > max_scroll) s.doc_scroll = max_scroll;
+    if (s.doc_scroll < 0)          s.doc_scroll = 0;
+
+    for (int i = 0; i < h; ++i) {
+        int idx = s.doc_scroll + i;
+        if (idx >= (int)rows.size()) break;
+        bool is_edit = reln[idx] >= 0;
+        bool on_sel  = focused && rdoc[idx] == sel;
+
+        std::string out;
+        if (is_edit)     out.append(Colors::yellow).append("┃ ").append(Colors::reset);
+        else if (on_sel) out.append(Colors::green_b).append("┃ ").append(Colors::reset);
+        else             out.append(Colors::dgray).append("│ ").append(Colors::reset);
+
+        if (is_edit) {
+            const std::string& body = rows[idx];
+            int hs = (reln[idx] == s.edit_cy)
+                ? compute_hscroll((int)body.size(), s.edit_cx, avail) : 0;
+            int start = std::min((int)body.size(), hs);
+            int show  = std::min(avail, (int)body.size() - start);
+            out.append(term::highlight(body.substr(start, std::max(0, show))));
+            term::line(x, y + i, out);
+            if (reln[idx] == s.edit_cy)
+                render_block_cursor(x + 2 + (s.edit_cx - hs), y + i, body, s.edit_cx);
+        } else {
+            out.append(term::highlight(rows[idx]));
+            term::line(x, y + i, out);
+        }
+    }
+
+    if (max_scroll > 0) {
+        int gh = std::max(1, h * h / std::max(1, (int)rows.size()));
+        int gy = (h - gh) * s.doc_scroll / max_scroll;
+        for (int i = 0; i < h; ++i) {
+            const char* glyph = (i >= gy && i < gy + gh) ? "▐" : " ";
+            const char* col   = (i >= gy && i < gy + gh) ? Colors::green : Colors::dgray;
+            std::string g; g.append(col).append(glyph).append(Colors::reset);
+            term::line(x + w - 2, y + i, g);
+        }
+    }
+}
+
 // Block-style "I'm here" cursor. Reverse-video swaps the cell's foreground
 // and background using whatever the terminal's current theme provides, so
 // it's always visible — no dependence on 256-color palette mapping.
@@ -914,7 +1078,7 @@ void render_query_wide(State& s) {
 
     term::box(1,        3, DB_W,  H, "databases",  s.q_focus == 0);
     term::box(DB_W,     3, COL_W, H, "collections", s.q_focus == 0 || s.col_searching);
-    term::box(DOC_X,    3, DOC_W, H, "documents",  s.q_focus > 0);
+    term::box(DOC_X,    3, DOC_W, H, "documents",  s.q_focus == DOC_FOCUS);
 
     // Databases
     int dvis = H - 4;
@@ -949,14 +1113,14 @@ void render_query_wide(State& s) {
 
     int QX = DOC_X + 2;
     int QW = std::max(0, DOC_W - 4);
-    term::qfield(QX, 4, QW, "filter",  s.query,     s.q_focus == 1);
-    term::qfield(QX, 5, QW, "project", s.q_project, s.q_focus == 2);
-    term::qfield(QX, 6, QW, "sort",    s.q_sort,    s.q_focus == 3);
-    term::qfield(QX, 7, QW, "skip",    s.q_skip,    s.q_focus == 4);
-    term::qfield(QX, 8, QW, "limit",   s.q_limit,   s.q_focus == 5);
+    term::qfield(QX, 4, QW, "filter",  s.query,     s.q_focus == 1, s.q_cx, "{}");
+    term::qfield(QX, 5, QW, "project", s.q_project, s.q_focus == 2, s.q_cx);
+    term::qfield(QX, 6, QW, "sort",    s.q_sort,    s.q_focus == 3, s.q_cx);
+    term::qfield(QX, 7, QW, "skip",    s.q_skip,    s.q_focus == 4, s.q_cx);
+    term::qfield(QX, 8, QW, "limit",   s.q_limit,   s.q_focus == 5, s.q_cx);
     rule(QX, 9, DOC_W - 4);
 
-    render_doc_pane(s.docs, QX, 10, DOC_W - 2, H - 8, s.doc_scroll);
+    render_doc_pane_sel(s, QX, 10, DOC_W - 2, H - 8);
 }
 
 void render_query_stack(State& s) {
@@ -982,24 +1146,25 @@ void render_query_stack(State& s) {
     int full_w = std::max(0, W - 6);
     int half_w = std::max(0, W / 2 - 4);
     int top_w  = (W >= 70) ? half_w : full_w;
-    term::qfield(3, qy + 1, top_w,  "filter",  s.query,     s.q_focus == 1);
-    term::qfield(3, qy + 2, top_w,  "project", s.q_project, s.q_focus == 2);
-    term::qfield(3, qy + 3, full_w, "sort",    s.q_sort,    s.q_focus == 3);
+    term::qfield(3, qy + 1, top_w,  "filter",  s.query,     s.q_focus == 1, s.q_cx, "{}");
+    term::qfield(3, qy + 2, top_w,  "project", s.q_project, s.q_focus == 2, s.q_cx);
+    term::qfield(3, qy + 3, full_w, "sort",    s.q_sort,    s.q_focus == 3, s.q_cx);
     if (W >= 70) {
-        term::qfield(3 + W / 2, qy + 1, half_w, "skip",  s.q_skip,  s.q_focus == 4);
-        term::qfield(3 + W / 2, qy + 2, half_w, "limit", s.q_limit, s.q_focus == 5);
+        term::qfield(3 + W / 2, qy + 1, half_w, "skip",  s.q_skip,  s.q_focus == 4, s.q_cx);
+        term::qfield(3 + W / 2, qy + 2, half_w, "limit", s.q_limit, s.q_focus == 5, s.q_cx);
     } else {
-        term::qfield(3, qy + 4, full_w, "skip",  s.q_skip,  s.q_focus == 4);
-        term::qfield(3, qy + 5, full_w, "limit", s.q_limit, s.q_focus == 5);
+        term::qfield(3, qy + 4, full_w, "skip",  s.q_skip,  s.q_focus == 4, s.q_cx);
+        term::qfield(3, qy + 5, full_w, "limit", s.q_limit, s.q_focus == 5, s.q_cx);
         qy += 2;
     }
 
     int doc_y = qy + 5;
     rule(2, doc_y - 1, W - 4);
     std::string lbl;
-    lbl.append(Colors::dgray).append("documents").append(Colors::reset);
+    lbl.append(s.q_focus == DOC_FOCUS ? Colors::green_b : Colors::dgray)
+       .append("documents").append(Colors::reset);
     term::line(3, doc_y - 1, lbl);
-    render_doc_pane(s.docs, 3, doc_y, W - 4, H + 2 - doc_y, s.doc_scroll);
+    render_doc_pane_sel(s, 3, doc_y, W - 4, H + 2 - doc_y);
 }
 
 // ---------- AGGREGATION ----------
@@ -1180,6 +1345,27 @@ void render_export_modal() {
     term::line(x, y + 1, bot);
 }
 
+// A single-line confirmation popup (used for delete). `accent` tints the border.
+void render_confirm_modal(const std::string& msg, const char* accent) {
+    int W = term::W, H = term::H;
+    int x = std::max(1, (W - (int)msg.size()) / 2);
+    int y = std::max(3, H / 2);
+    std::string top, mid, bot;
+    top.append(accent).append("┌");
+    for (size_t i = 0; i < msg.size(); ++i) top.append("─");
+    top.append("┐").append(Colors::reset);
+    mid.append(accent).append("│").append(Colors::reset)
+       .append(Colors::bg_sel).append(Colors::bold).append(Colors::white)
+       .append(msg).append(Colors::reset)
+       .append(accent).append("│").append(Colors::reset);
+    bot.append(accent).append("└");
+    for (size_t i = 0; i < msg.size(); ++i) bot.append("─");
+    bot.append("┘").append(Colors::reset);
+    term::line(x, y - 1, top);
+    term::line(x, y,     mid);
+    term::line(x, y + 1, bot);
+}
+
 } // anonymous
 
 void render(State& s) {
@@ -1201,10 +1387,55 @@ void render(State& s) {
 
     render_footer(s);
     if (s.export_menu) render_export_modal();
+    if (s.del_confirm)
+        render_confirm_modal("  delete this document?   ·   [y] yes   [esc] no  ",
+                             Colors::red);
     term::flush_out();
 }
 
 namespace {
+
+// ---------- workspace tabs: snapshot <-> live State ----------
+
+// Snapshot the active tab's live fields into tabs[tab_i].
+void save_tab(State& s) {
+    if (s.tabs.empty()) s.tabs.resize(1);
+    Tab& t = s.tabs[s.tab_i];
+    t.cols=s.cols; t.filtered=s.filtered; t.col_search=s.col_search; t.col_searching=s.col_searching;
+    t.db_i=s.db_i; t.col_i=s.col_i; t.col_scroll=s.col_scroll;
+    t.docs=s.docs; t.doc_scroll=s.doc_scroll; t.doc_count=s.doc_count; t.doc_shown=s.doc_shown;
+    t.doc_raw=s.doc_raw; t.doc_ids=s.doc_ids; t.doc_sel=s.doc_sel;
+    t.edit_active=s.edit_active; t.edit_lines=s.edit_lines;
+    t.edit_cx=s.edit_cx; t.edit_cy=s.edit_cy; t.edit_scroll=s.edit_scroll;
+    t.edit_selector=s.edit_selector; t.edit_status=s.edit_status; t.del_confirm=s.del_confirm;
+    t.page=s.page; t.page_size=s.page_size;
+    t.query=s.query; t.q_project=s.q_project; t.q_sort=s.q_sort; t.q_skip=s.q_skip; t.q_limit=s.q_limit;
+    t.q_focus=s.q_focus; t.q_cx=s.q_cx;
+    t.mode=s.mode;
+    t.shell_cmd=s.shell_cmd; t.shell_cx=s.shell_cx; t.shell_scroll=s.shell_scroll;
+    t.agg_lines=s.agg_lines; t.cursor_x=s.cursor_x; t.cursor_y=s.cursor_y; t.agg_scroll=s.agg_scroll;
+    t.ac_active=s.ac_active; t.ac_matches=s.ac_matches; t.ac_i=s.ac_i; t.ac_token=s.ac_token;
+}
+
+// Load tabs[tab_i] into the active live fields.
+void load_tab(State& s) {
+    if (s.tabs.empty()) s.tabs.resize(1);
+    const Tab& t = s.tabs[s.tab_i];
+    s.cols=t.cols; s.filtered=t.filtered; s.col_search=t.col_search; s.col_searching=t.col_searching;
+    s.db_i=t.db_i; s.col_i=t.col_i; s.col_scroll=t.col_scroll;
+    s.docs=t.docs; s.doc_scroll=t.doc_scroll; s.doc_count=t.doc_count; s.doc_shown=t.doc_shown;
+    s.doc_raw=t.doc_raw; s.doc_ids=t.doc_ids; s.doc_sel=t.doc_sel;
+    s.edit_active=t.edit_active; s.edit_lines=t.edit_lines;
+    s.edit_cx=t.edit_cx; s.edit_cy=t.edit_cy; s.edit_scroll=t.edit_scroll;
+    s.edit_selector=t.edit_selector; s.edit_status=t.edit_status; s.del_confirm=t.del_confirm;
+    s.page=t.page; s.page_size=t.page_size;
+    s.query=t.query; s.q_project=t.q_project; s.q_sort=t.q_sort; s.q_skip=t.q_skip; s.q_limit=t.q_limit;
+    s.q_focus=t.q_focus; s.q_cx=t.q_cx;
+    s.mode=t.mode;
+    s.shell_cmd=t.shell_cmd; s.shell_cx=t.shell_cx; s.shell_scroll=t.shell_scroll;
+    s.agg_lines=t.agg_lines; s.cursor_x=t.cursor_x; s.cursor_y=t.cursor_y; s.agg_scroll=t.agg_scroll;
+    s.ac_active=t.ac_active; s.ac_matches=t.ac_matches; s.ac_i=t.ac_i; s.ac_token=t.ac_token;
+}
 
 // Run the current find with pagination applied. Page offset stacks on top of
 // the user's q_skip; we always ask the server for page_size docs and let the
@@ -1226,9 +1457,12 @@ void run_paginated_find(State& s) {
         s.filtered.empty() ? std::string() : s.filtered[s.col_i],
         s.query, s.q_project, s.q_sort, skip_arg, s.q_limit, s.page_size);
     s.docs       = std::move(r.lines);
+    s.doc_raw    = std::move(r.raw);
+    s.doc_ids    = std::move(r.ids);
     s.doc_count  = r.total;
     s.doc_shown  = r.shown;
     s.doc_scroll = 0;
+    s.doc_sel    = 0;
 
     // Clamp the page if we walked off the end (e.g. doc_count shrank since
     // the previous fetch). Re-fetches page 0 silently if needed.
@@ -1297,9 +1531,64 @@ void run_paginated_agg(State& s, bool recount) {
     }
 }
 
+// ---------- per-document actions ----------
+
+std::string cur_db (State& s) { return s.dbs.empty()      ? std::string() : s.dbs[s.db_i]; }
+std::string cur_col(State& s) { return s.filtered.empty() ? std::string() : s.filtered[s.col_i]; }
+
+// True when the documents pane is focused and points at a real document.
+bool doc_actionable(State& s) {
+    return s.mode == mongodb::ViewMode::Query
+        && s.q_focus == DOC_FOCUS
+        && s.doc_sel >= 0
+        && s.doc_sel < (int)s.doc_raw.size();
+}
+
+// Copy text to the system clipboard, best-effort, per platform:
+//   Windows → clip   ·   macOS → pbcopy   ·   Linux → wl-copy / xclip / xsel.
+bool copy_to_clipboard(const std::string& text) {
+#ifdef _WIN32
+    const char* cmd = "clip";
+#elif defined(__APPLE__)
+    const char* cmd = "pbcopy";
+#else
+    const char* cmd = nullptr;
+    if      (std::system("command -v wl-copy >/dev/null 2>&1") == 0) cmd = "wl-copy";
+    else if (std::system("command -v xclip  >/dev/null 2>&1") == 0) cmd = "xclip -selection clipboard";
+    else if (std::system("command -v xsel   >/dev/null 2>&1") == 0) cmd = "xsel --clipboard --input";
+    if (!cmd) return false;
+#endif
+    FILE* p = MONGUI_POPEN(cmd, "w");
+    if (!p) return false;
+    std::fwrite(text.data(), 1, text.size(), p);
+    return MONGUI_PCLOSE(p) == 0;
+}
+
+// Open the full-screen editor on the selected document.
+void begin_edit(State& s) {
+    if (!doc_actionable(s)) return;
+    if (s.doc_sel >= (int)s.doc_ids.size() || s.doc_ids[s.doc_sel].empty()) {
+        s.status_msg = "⚠ document has no _id — cannot edit";
+        return;
+    }
+    s.edit_selector = s.doc_ids[s.doc_sel];
+    s.edit_lines.clear();
+    std::string line;
+    for (char c : s.doc_raw[s.doc_sel]) {
+        if (c == '\n') { s.edit_lines.push_back(line); line.clear(); }
+        else           { line.push_back(c); }
+    }
+    s.edit_lines.push_back(line);
+    if (s.edit_lines.empty()) s.edit_lines.push_back("{}");
+    s.edit_cx = s.edit_cy = s.edit_scroll = 0;
+    s.edit_status.clear();
+    s.edit_active = true;
+}
+
 } // namespace
 
 void run(State& s) {
+    if (s.tabs.empty()) s.tabs.resize(1);   // tab 0 mirrors the initial State
     run_paginated_find(s);
 
     while (true) {
@@ -1338,6 +1627,99 @@ void run(State& s) {
             continue;
         }
 
+        // -------- EDIT MODAL (full-screen document editor) --------
+        if (s.edit_active) {
+            if (k.empty() || k == std::string("\x1b", 1)) {  // ESC cancels
+                s.edit_active = false;
+                continue;
+            }
+            if (k == std::string("\x13", 1)) {               // ^s saves
+                std::string text;
+                for (size_t i = 0; i < s.edit_lines.size(); ++i) {
+                    if (i) text.push_back('\n');
+                    text += s.edit_lines[i];
+                }
+                term::busy("Saving document…");
+                mongodb::WriteResult w = mongodb::replace_doc(
+                    cur_db(s), cur_col(s), s.edit_selector, text);
+                if (w.ok) {
+                    s.edit_active = false;
+                    s.status_msg  = w.message;
+                    run_paginated_find(s);
+                } else {
+                    s.edit_status = w.message;
+                }
+                continue;
+            }
+            if (s.edit_cy < 0) s.edit_cy = 0;
+            if (s.edit_cy >= (int)s.edit_lines.size()) s.edit_cy = (int)s.edit_lines.size() - 1;
+            std::string& cur = s.edit_lines[s.edit_cy];
+            if (s.edit_cx > (int)cur.size()) s.edit_cx = (int)cur.size();
+
+            if (k == "LEFT") {
+                if (s.edit_cx > 0) --s.edit_cx;
+                else if (s.edit_cy > 0) { --s.edit_cy; s.edit_cx = (int)s.edit_lines[s.edit_cy].size(); }
+                continue;
+            }
+            if (k == "RIGHT") {
+                if (s.edit_cx < (int)cur.size()) ++s.edit_cx;
+                else if (s.edit_cy + 1 < (int)s.edit_lines.size()) { ++s.edit_cy; s.edit_cx = 0; }
+                continue;
+            }
+            if (k == "UP") {
+                if (s.edit_cy > 0) { --s.edit_cy; s.edit_cx = std::min(s.edit_cx, (int)s.edit_lines[s.edit_cy].size()); }
+                continue;
+            }
+            if (k == "DOWN") {
+                if (s.edit_cy + 1 < (int)s.edit_lines.size()) { ++s.edit_cy; s.edit_cx = std::min(s.edit_cx, (int)s.edit_lines[s.edit_cy].size()); }
+                continue;
+            }
+            if (k == "\x7f" || k == "\x08") {                // backspace
+                if (s.edit_cx > 0) { cur.erase(s.edit_cx - 1, 1); --s.edit_cx; }
+                else if (s.edit_cy > 0) {
+                    int prev = (int)s.edit_lines[s.edit_cy - 1].size();
+                    s.edit_lines[s.edit_cy - 1] += cur;
+                    s.edit_lines.erase(s.edit_lines.begin() + s.edit_cy);
+                    --s.edit_cy; s.edit_cx = prev;
+                }
+                s.edit_status.clear();
+                continue;
+            }
+            if (k == "\r") {                                 // enter splits the line
+                std::string right = cur.substr(s.edit_cx);
+                cur.erase(s.edit_cx);
+                s.edit_lines.insert(s.edit_lines.begin() + s.edit_cy + 1, right);
+                ++s.edit_cy; s.edit_cx = 0;
+                continue;
+            }
+            if (k.size() == 1 && (unsigned char)k[0] >= 32) {
+                cur.insert(s.edit_cx, k);
+                ++s.edit_cx;
+                s.edit_status.clear();
+                continue;
+            }
+            continue;   // swallow anything else while editing
+        }
+
+        // -------- DELETE CONFIRM --------
+        if (s.del_confirm) {
+            s.del_confirm = false;
+            if (k == "y" || k == "Y" || k == "\r") {
+                if (doc_actionable(s) && s.doc_sel < (int)s.doc_ids.size()
+                    && !s.doc_ids[s.doc_sel].empty()) {
+                    term::busy("Deleting document…");
+                    mongodb::WriteResult w = mongodb::delete_doc(
+                        cur_db(s), cur_col(s), s.doc_ids[s.doc_sel]);
+                    s.status_msg = w.message;
+                    if (w.ok) {
+                        if (s.doc_sel > 0) --s.doc_sel;   // keep selection sensible
+                        run_paginated_find(s);
+                    }
+                }
+            }
+            continue;
+        }
+
         // -------- EXIT (Ctrl+C twice) --------
         if (k == std::string("\x03", 1)) {
             if (s.confirm_exit) break;
@@ -1348,6 +1730,36 @@ void run(State& s) {
 
         // -------- EXPORT (^o opens the picker) --------
         if (k == std::string("\x0f", 1)) { s.export_menu = true; continue; }
+
+        // -------- TABS: ^t new · ^w close · ^b next --------
+        if (k == std::string("\x14", 1)) {                 // ^t new tab
+            if ((int)s.tabs.size() >= MAX_TABS) { s.status_msg = "⚠ max 5 tabs"; continue; }
+            save_tab(s);
+            Tab t;
+            t.db_i = s.db_i;                                // open on the current db
+            s.tabs.push_back(t);
+            s.tab_i = (int)s.tabs.size() - 1;
+            load_tab(s);
+            load_cols(s);
+            term::busy("Loading…");
+            run_paginated_find(s);
+            continue;
+        }
+        if (k == std::string("\x17", 1)) {                 // ^w close tab
+            if ((int)s.tabs.size() <= 1) { s.status_msg = "⚠ last tab"; continue; }
+            s.tabs.erase(s.tabs.begin() + s.tab_i);
+            if (s.tab_i >= (int)s.tabs.size()) s.tab_i = (int)s.tabs.size() - 1;
+            load_tab(s);
+            continue;
+        }
+        if (k == std::string("\x02", 1)) {                 // ^b next tab
+            if ((int)s.tabs.size() > 1) {
+                save_tab(s);
+                s.tab_i = (s.tab_i + 1) % (int)s.tabs.size();
+                load_tab(s);
+            }
+            continue;
+        }
 
         // -------- ^f toggle collection search --------
         if (k == std::string("\x06", 1) && s.mode == mongodb::ViewMode::Query) {
@@ -1363,17 +1775,81 @@ void run(State& s) {
             continue;
         }
 
-        // -------- Tab: cycle q_focus --------
+        // -------- Tab: cycle q_focus (nav → 5 fields → documents) --------
         if (k == "\t" && s.mode == mongodb::ViewMode::Query) {
-            s.q_focus = (s.q_focus + 1) % (5 + 1);
+            s.q_focus = (s.q_focus + 1) % (DOC_FOCUS + 1);
+            auto* p = q_field_ptr(s, s.q_focus);
+            s.q_cx = p ? (int)p->size() : 0;   // land cursor at end of field
+            if (s.q_focus == DOC_FOCUS) {       // clamp selection on entry
+                if (s.doc_sel < 0) s.doc_sel = 0;
+                if (s.doc_sel >= s.doc_shown) s.doc_sel = std::max(0, s.doc_shown - 1);
+            }
             continue;
         }
 
-        // Backspace in focused query field.
-        if ((k == "\x7f" || k == "\x08")
-            && s.mode == mongodb::ViewMode::Query && s.q_focus > 0) {
+        // -------- Documents pane: selection + per-document actions --------
+        if (s.mode == mongodb::ViewMode::Query && s.q_focus == DOC_FOCUS) {
+            int last = s.doc_shown - 1;
+            if (k == "DOWN" || k == "j") {
+                if (s.doc_sel < last) ++s.doc_sel;
+                continue;
+            }
+            if (k == "UP" || k == "k") {
+                if (s.doc_sel > 0) --s.doc_sel;
+                continue;
+            }
+            if (k == "y") {                                  // copy to clipboard
+                if (doc_actionable(s)) {
+                    s.status_msg = copy_to_clipboard(s.doc_raw[s.doc_sel])
+                                 ? "✔ document copied to clipboard"
+                                 : "⚠ clipboard unavailable";
+                }
+                continue;
+            }
+            if (k == "c") {                                  // clone
+                if (doc_actionable(s)) {
+                    term::busy("Cloning document…");
+                    mongodb::WriteResult w = mongodb::clone_doc(
+                        cur_db(s), cur_col(s), s.doc_raw[s.doc_sel]);
+                    s.status_msg = w.message;
+                    if (w.ok) run_paginated_find(s);
+                }
+                continue;
+            }
+            if (k == "d") {                                  // delete (confirm)
+                if (doc_actionable(s)) s.del_confirm = true;
+                continue;
+            }
+            if (k == "e" || k == "\r") {                     // edit
+                begin_edit(s);
+                continue;
+            }
+            // other keys (mode switches, paging, ^o, etc.) fall through below
+        }
+
+        // Cursor movement within the focused query field.
+        if (k == "LEFT" && s.mode == mongodb::ViewMode::Query
+            && s.q_focus >= 1 && s.q_focus <= 5) {
+            if (s.q_cx > 0) --s.q_cx;
+            continue;
+        }
+        if (k == "RIGHT" && s.mode == mongodb::ViewMode::Query
+            && s.q_focus >= 1 && s.q_focus <= 5) {
             auto* p = q_field_ptr(s, s.q_focus);
-            if (p && !p->empty()) p->pop_back();
+            int len = p ? (int)p->size() : 0;
+            if (s.q_cx < len) ++s.q_cx;
+            continue;
+        }
+
+        // Backspace at the cursor in the focused query field.
+        if ((k == "\x7f" || k == "\x08")
+            && s.mode == mongodb::ViewMode::Query
+            && s.q_focus >= 1 && s.q_focus <= 5) {
+            auto* p = q_field_ptr(s, s.q_focus);
+            if (p) {
+                if (s.q_cx > (int)p->size()) s.q_cx = (int)p->size();
+                if (s.q_cx > 0) { p->erase(s.q_cx - 1, 1); --s.q_cx; }
+            }
             continue;
         }
 
@@ -1501,10 +1977,14 @@ void run(State& s) {
         }
 
         // -------- Query-field input --------
-        if (s.mode == mongodb::ViewMode::Query && s.q_focus > 0
+        if (s.mode == mongodb::ViewMode::Query && s.q_focus >= 1 && s.q_focus <= 5
             && k.size() == 1 && (unsigned char)k[0] >= 32) {
             auto* p = q_field_ptr(s, s.q_focus);
-            if (p) p->append(k);
+            if (p) {
+                if (s.q_cx > (int)p->size()) s.q_cx = (int)p->size();
+                p->insert(s.q_cx, k);
+                ++s.q_cx;
+            }
             continue;
         }
 

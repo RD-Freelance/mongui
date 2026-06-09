@@ -9,7 +9,7 @@ through results, and drive a mongosh-style shell — all in a single binary
 that adapts to whatever terminal size you give it.
 
 ```
- mongui  ·  admin › users                                            QUERY
+ mongui   1 users   2 orders   3 events                              QUERY
 
 ┌ databases ────────┐┌ collections ─────────────┐┌ documents ────────────────
 │ › admin           ││ search ▸ user            ││ filter  ▸ { age: { $gt: 21 } }
@@ -17,13 +17,13 @@ that adapts to whatever terminal size you give it.
 │   local           ││   user_events            ││ sort    ▸ { _id: -1 }
 │   myapp           ││   user_sessions          ││ skip    ▸    limit ▸ 50
 └───────────────────┘└──────────────────────────┘│ ─────────────────────────
-                                                  │ │ {
-                                                  │ │   "_id": ObjectId("…"),
-                                                  │ │   "name": "alice",
-                                                  │ │   "age": 30
-                                                  │ │ }
+                                                  │ ┃ {
+                                                  │ ┃   "_id": ObjectId("…"),
+                                                  │ ┃   "name": "alice",   ← selected
+                                                  │ ┃   "age": 30
+                                                  │ ┃ }
 
- ^e query  ^a agg  ^s shell    tab field  ^f search  ↵ find    ^o export  ^q quit
+ ^e query  ^a agg  ^s shell   tab field  y copy  c clone  e edit  d delete   ^t/^b/^w tabs  ^q quit
                                                                          3 / 1,204 docs
 ```
 
@@ -32,6 +32,10 @@ that adapts to whatever terminal size you give it.
 ## Highlights
 
 - **Three modes** — Query, Aggregation, Shell — toggled with `^E` / `^A` / `^S`
+- **Workspace tabs** — up to 5 independent collection + documents views, each with its own query, pipeline, shell, and mode (`^T` new · `^B` next · `^W` close)
+- **Per-document actions** — select a document in the pane and **copy** (`y`), **clone** (`c`, drops `_id`), **edit inline** (`e`), or **delete** (`d`)
+- **Inline document editor** — edit a document in place as JSON and save with `^S` (`replaceOne` by `_id`); no separate window
+- **Non-interactive import** — `mongui --import --db … --collection … --filepath …` loads a JSON array, NDJSON, or a single document straight into a collection
 - **Server-side pagination** — `^N` / `^P` through find results *and* aggregation previews
 - **Responsive layout** — three-pane on wide terminals, vertically stacked on narrow ones
 - **Full BSON output** — long values wrap onto continuation rows, nothing is hidden
@@ -48,36 +52,136 @@ that adapts to whatever terminal size you give it.
 ## Build
 
 Requires a C++17 compiler and the MongoDB C driver (mongo-c-driver 2.x or
-libmongoc-1.0).
+libmongoc-1.0). The provided installers handle every dependency for you.
 
-### CMake
+### One-command install
+
+**Linux / macOS** — installs the toolchain + driver, builds, and puts `mongui`
+on your PATH:
 
 ```bash
-brew install mongo-c-driver cmake          # macOS
+git clone https://github.com/RD-Freelance/mongui && cd mongui
+./scripts/install.sh
+mongui
+```
+
+The script auto-detects your package manager (apt, dnf/yum, pacman, zypper,
+apk, or Homebrew) and builds the MongoDB C driver from source if your distro
+has no package for it. Override the location with
+`PREFIX=$HOME/.local ./scripts/install.sh`.
+
+**Windows 10/11** (PowerShell, in the repo root) — installs Git, CMake, the
+MSVC C++ build tools (via winget when missing), fetches the driver with vcpkg,
+builds, and adds `mongui.exe` to your PATH:
+
+```powershell
+git clone https://github.com/RD-Freelance/mongui; cd mongui
+./scripts/install.bat        # or:  powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+```
+
+> **Windows note:** mongui renders with ANSI/VT escape sequences, so it needs
+> Windows 10 1903+ and works best in **Windows Terminal**. The classic
+> `conhost` console may not render the box-drawing characters cleanly.
+
+### Manual CMake build
+
+```bash
+# macOS:  brew install mongo-c-driver cmake
+# Debian/Ubuntu:  sudo apt install build-essential cmake pkg-config libmongoc-dev libbson-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ./build/mongui
 ```
 
-### Direct (no CMake)
+The build finds the driver via a CMake package config (vcpkg / Windows) or
+pkg-config (Homebrew / Linux), whichever is present. On Apple Silicon it
+auto-points pkg-config at `/opt/homebrew/lib/pkgconfig`.
+
+### Clipboard support
+
+The documents-pane **copy** action shells out to a clipboard tool: `pbcopy`
+(macOS), `clip` (Windows), or `wl-copy` / `xclip` / `xsel` (Linux — the
+installer adds `xclip` where available).
+
+### Uninstall
+
+The quickest way is to let mongui remove itself:
 
 ```bash
-clang++ -std=c++17 -O2 -DMONGUI_VERSION='"0.1.0"' \
-  $(pkg-config --cflags mongoc2) \
-  -o mongui src/main.cpp src/term.cpp src/mongo.cpp src/app.cpp \
-  $(pkg-config --libs mongoc2)
-./mongui
+mongui --uninstall        # asks to confirm; deletes its own binary
+mongui --uninstall -y     # skip the confirmation prompt
 ```
 
-On Apple Silicon, the CMake build auto-points pkg-config at
-`/opt/homebrew/lib/pkgconfig`.
+It deletes only the running binary. If it was installed somewhere you need
+root for (e.g. `/usr/local/bin`), re-run with `sudo mongui --uninstall`. On
+Windows the binary can't delete itself while running, so mongui schedules a
+detached command to remove it a moment after it exits (then drop the install
+dir from your PATH).
+
+Or use the scripts (these also know the standard install locations):
+
+```bash
+# Linux / macOS
+./scripts/uninstall.sh            # removes the mongui binary
+./scripts/uninstall.sh --build    # also delete ./build
+# installed to a custom prefix?  PREFIX=$HOME/.local ./scripts/uninstall.sh
+```
+
+```powershell
+# Windows
+./scripts/uninstall.bat                       # removes mongui.exe + PATH entry
+# or:  powershell -ExecutionPolicy Bypass -File scripts/uninstall.ps1 -RemoveBuild
+```
+
+The uninstallers remove only mongui itself — they deliberately leave the
+shared build tools and the MongoDB C driver in place, since other software may
+depend on them. Remove those with your package manager / vcpkg if you want.
 
 ### CLI flags
 
 ```
 mongui                    launch interactive TUI
 mongui -v, --version      print version, libmongoc version, license
-mongui -h, --help         print usage
+mongui -h, --help         print usage (also lists every in-TUI keybinding)
+mongui --uninstall [-y]   remove the installed mongui binary
+mongui --import …         bulk-import a file, then exit (see below)
+```
+
+---
+
+## Import (non-interactive)
+
+Load a file straight into a collection without opening the TUI:
+
+```bash
+mongui --import \
+  --uri mongodb://localhost:27017 \
+  --database shop \
+  --collection orders \
+  --filepath orders.json
+```
+
+- `--import` is implied whenever `--filepath` is given.
+- `--uri` defaults to `mongodb://localhost:27017` if omitted.
+- `--database` / `--db`, `--collection` / `--col`, and `--filepath` / `--file`
+  are interchangeable aliases. Every flag accepts `--flag value` or `--flag=value`.
+
+The file may be any of:
+
+| Format | Example |
+|--------|---------|
+| **JSON array** | `[ { "name": "a" }, { "name": "b" } ]` |
+| **NDJSON** (one doc per line) | `{"name":"a"}`<br>`{"name":"b"}` — mongoexport's default |
+| **Single document** | `{ "name": "a" }` (may span multiple lines) |
+
+Relaxed / mongosh JSON is accepted in all three (`ObjectId("…")`, unquoted keys,
+single quotes, trailing commas — see [Relaxed BSON](#relaxed-bson)). Documents
+are inserted in batches; the command prints a summary and exits non-zero on
+failure:
+
+```
+Importing orders.json → shop.orders …
+✔ imported 1284 document(s)
 ```
 
 ---
@@ -118,17 +222,38 @@ the next card — `↵` accepts, type a name to override.
 ### Query — `^E`
 
 Pick a database and collection, type a filter, run `find`. Query bar has
-five fields: filter, projection, sort, skip, limit.
+five fields: filter (defaults to `{}`), projection, sort, skip, limit. `TAB`
+cycles through the five fields and then the **documents** pane.
 
 | Key | Action |
 |-----|--------|
-| `↑ / ↓` | Navigate databases |
-| `← / →` | Navigate collections |
+| `↑ / ↓` | Navigate databases (in nav focus) |
+| `← / →` | Navigate collections (in nav focus) |
 | `^F` | Toggle fuzzy collection search |
-| `TAB` | Cycle filter / project / sort / skip / limit |
+| `TAB` | Cycle nav → filter / project / sort / skip / limit → documents |
 | `↵` | Run `find` (resets to page 1) |
 | `^N / ^P` | Next / previous page |
 | `^J / ^K` | Scroll the document pane |
+
+### Documents pane — per-document actions
+
+`TAB` until the **documents** pane is focused (it gains a green title and a
+selection bar). The selected document is marked with a `┃` gutter.
+
+| Key | Action |
+|-----|--------|
+| `j / k` or `↑ / ↓` | Move the selection between documents |
+| `y` | Copy the document JSON to the system clipboard (`pbcopy`) |
+| `c` | Clone the document — re-inserts a copy **without `_id`** so the server mints a new one |
+| `e` or `↵` | Edit the document **inline** as JSON (see below) |
+| `d` | Delete the document — opens a `y` / `esc` confirm popup |
+
+**Inline editor.** `e` turns the selected document into an editable JSON
+buffer right where it sits (yellow gutter + block cursor). Type to edit;
+`^S` saves via `replaceOne` on its `_id`; `esc` cancels. Clone/edit accept
+the same relaxed BSON as the shell, so `ObjectId(...)`, `ISODate(...)`, etc.
+are fine. Documents without an `_id` (e.g. some projections) can't be
+edited or deleted.
 
 ### Aggregation — `^A`
 
@@ -200,6 +325,22 @@ db.users.dropIndexes()        // drops all except _id
 
 ---
 
+## Tabs
+
+Open up to **5 workspace tabs**, each a fully independent collection +
+documents view with its own query bar, aggregation pipeline, shell buffer,
+view mode, selection, and pagination. The tab bar across the top shows one
+chip per tab; only the active tab fetches and renders data, so switching is
+instant. A new tab opens on the currently selected database.
+
+| Key | Action |
+|-----|--------|
+| `^T` | New tab (opens on the current db; max 5) |
+| `^B` | Switch to the next tab (wraps around) |
+| `^W` | Close the current tab (last one stays open) |
+
+---
+
 ## Relaxed BSON
 
 The shell and the query/pipeline editors accept mongosh-flavored input and
@@ -268,6 +409,7 @@ wrapped rows with `^J` / `^K`.
 | Key | Action |
 |-----|--------|
 | `^E / ^A / ^S` | Switch to Query / Aggregation / Shell |
+| `^T / ^B / ^W` | New / next / close tab |
 | `^O` | Open export picker |
 | `^J / ^K` | Scroll documents down / up |
 | `^Q` or `^C` × 2 | Quit (clears the terminal) |
@@ -278,8 +420,18 @@ wrapped rows with `^J` / `^K`.
 | `↑ / ↓` | Navigate databases |
 | `← / →` | Navigate collections |
 | `^F` | Toggle collection search |
-| `TAB` | Next query field |
+| `TAB` | Next query field, then the documents pane |
 | `↵` | Run `find` |
+
+### Documents pane (after `TAB` into it)
+| Key | Action |
+|-----|--------|
+| `j / k` or `↑ / ↓` | Select document |
+| `y` | Copy to clipboard |
+| `c` | Clone (without `_id`) |
+| `e` or `↵` | Edit inline |
+| `d` | Delete (with confirm) |
+| `^S` / `esc` | Save / cancel while editing |
 
 ### Aggregation
 | Key | Action |
@@ -307,9 +459,15 @@ wrapped rows with `^J` / `^K`.
 src/
   main.cpp      — entry, alt-screen, sigint, clean-exit screen clear
   app.hpp/cpp   — State, render(), input loop, editor helpers, layouts
-  term.hpp/cpp  — frame buffer, ANSI, raw mode, key reader, syntax highlighter
+  term.hpp/cpp  — frame buffer, ANSI, raw mode (POSIX termios / Win32 console),
+                  key reader, syntax highlighter
   mongo.hpp/cpp — pooled libmongoc, relaxed-BSON parser,
-                  find / aggregate / shell / indexes / export
+                  find / aggregate / shell / indexes / writes / import / export
+scripts/
+  install.sh    — one-command install for Linux & macOS
+  uninstall.sh  — remove the binary (Linux & macOS)
+  install.ps1   — one-command install for Windows (+ install.bat wrapper)
+  uninstall.ps1 — remove the binary + PATH entry (+ uninstall.bat wrapper)
 CMakeLists.txt
 README.md
 ```
@@ -333,9 +491,15 @@ blow-ups on pathological inputs. Empty db/col are caught at the public
 query boundary. `term::line()` silently drops writes that fall outside the
 screen, so a mid-render resize can't corrupt the display.
 
-**Cursor.** The aggregation block-cursor uses ANSI reverse video
-(`\x1b[7m`), not a 256-color background — visible on every terminal
-regardless of theme.
+**Cursor.** One block-cursor style — ANSI reverse video (`\x1b[7m`), not a
+256-color background — is shared across the shell, the aggregation editor,
+the query fields, and the inline document editor, so it's visible on every
+terminal regardless of theme.
+
+**Tabs.** The active tab's working set lives directly on `State`; inactive
+tabs are snapshotted into a `Tab` vector and swapped in/out on switch, so
+existing render and input code is unchanged — it always operates on the
+current tab.
 
 ---
 

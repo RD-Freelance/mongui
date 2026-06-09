@@ -6,9 +6,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <sys/ioctl.h>
-#include <termios.h>
-#include <unistd.h>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <io.h>
+#else
+#  include <sys/ioctl.h>
+#  include <termios.h>
+#  include <unistd.h>
+#endif
 
 namespace term {
 
@@ -19,8 +26,15 @@ int RIGHT_W = 90;
 
 namespace {
 
+#ifdef _WIN32
+DWORD saved_in_mode  = 0;
+DWORD saved_out_mode = 0;
+UINT  saved_out_cp   = 0;
+bool  console_saved  = false;
+#else
 termios saved_termios{};
 bool    termios_saved = false;
+#endif
 
 // Single-shot frame buffer: every draw call in a frame appends here, then
 // flush_out() emits the whole frame in one syscall. Single atomic write =
@@ -61,6 +75,39 @@ void flush_out() {
     std::fflush(stdout);
 }
 
+#ifdef _WIN32
+
+void raw_on() {
+    HANDLE hin  = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (!console_saved) {
+        GetConsoleMode(hin,  &saved_in_mode);
+        GetConsoleMode(hout, &saved_out_mode);
+        saved_out_cp  = GetConsoleOutputCP();
+        console_saved = true;
+    }
+    // Raw input: no line buffering / echo / Ctrl-C processing. We translate
+    // INPUT_RECORDs ourselves in read_key, so VT input is not required.
+    DWORD in_mode = saved_in_mode;
+    in_mode &= ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT);
+    SetConsoleMode(hin, in_mode);
+    // Enable ANSI escape interpretation on output (Windows 10+).
+    DWORD out_mode = saved_out_mode
+                   | ENABLE_PROCESSED_OUTPUT
+                   | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+    SetConsoleMode(hout, out_mode);
+    SetConsoleOutputCP(CP_UTF8);   // render the box-drawing / UTF-8 output
+}
+
+void raw_off() {
+    if (!console_saved) return;
+    SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE),  saved_in_mode);
+    SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), saved_out_mode);
+    SetConsoleOutputCP(saved_out_cp);
+}
+
+#else
+
 void raw_on() {
     if (!termios_saved && tcgetattr(STDIN_FILENO, &saved_termios) == 0) {
         termios_saved = true;
@@ -79,6 +126,8 @@ void raw_off() {
     }
 }
 
+#endif
+
 void move_cursor(int x, int y) {
     char buf[32];
     int n = std::snprintf(buf, sizeof(buf), "\x1b[%d;%dH", y, x);
@@ -95,8 +144,15 @@ void line(int x, int y, const std::string& text) {
 }
 
 void update_dims() {
-    winsize ws{};
     int cols = 0, rows = 0;
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO csbi{};
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi)) {
+        cols = csbi.srWindow.Right  - csbi.srWindow.Left + 1;
+        rows = csbi.srWindow.Bottom - csbi.srWindow.Top  + 1;
+    }
+#else
+    winsize ws{};
     for (int fd : {1, 0, 2}) {
         if (ioctl(fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
             cols = ws.ws_col;
@@ -104,7 +160,8 @@ void update_dims() {
             break;
         }
     }
-    if (cols == 0) { cols = 160; rows = 46; }
+#endif
+    if (cols <= 0) { cols = 160; rows = 46; }
 
     // Use real terminal dims, with a tiny floor that keeps draw math sane.
     // Layout code reacts to W (see app::pick_layout) — narrow terminals get a
@@ -124,6 +181,40 @@ void busy(const std::string& label) {
     line(x, y, out);
     flush_out();
 }
+
+#ifdef _WIN32
+
+std::string read_key() {
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+    INPUT_RECORD rec;
+    DWORD got = 0;
+    for (;;) {
+        if (!ReadConsoleInputW(hin, &rec, 1, &got) || got == 0) return {};
+        if (rec.EventType != KEY_EVENT || !rec.Event.KeyEvent.bKeyDown) continue;
+        const KEY_EVENT_RECORD& ke = rec.Event.KeyEvent;
+        switch (ke.wVirtualKeyCode) {
+            case VK_UP:     return "UP";
+            case VK_DOWN:   return "DOWN";
+            case VK_LEFT:   return "LEFT";
+            case VK_RIGHT:  return "RIGHT";
+            case VK_HOME:   return "HOME";
+            case VK_END:    return "END";
+            case VK_RETURN: return "\r";
+            case VK_TAB:    return "\t";
+            case VK_BACK:   return std::string(1, '\x7f');
+            case VK_ESCAPE: return std::string(1, '\x1b');
+            default: break;
+        }
+        wchar_t wc = ke.uChar.UnicodeChar;
+        if (wc == 0) continue;                       // modifier-only key event
+        if (wc < 0x80) return std::string(1, (char)wc);  // ASCII / Ctrl combos
+        char buf[4];
+        int len = WideCharToMultiByte(CP_UTF8, 0, &wc, 1, buf, sizeof(buf), nullptr, nullptr);
+        if (len > 0) return std::string(buf, len);
+    }
+}
+
+#else
 
 std::string read_key() {
     char c;
@@ -163,6 +254,8 @@ std::string read_key() {
     }
     return {};
 }
+
+#endif
 
 namespace {
 
@@ -338,38 +431,43 @@ void box(int x, int y, int w, int h, const std::string& title, bool active) {
 }
 
 void qfield(int x, int y, int w, const std::string& label,
-            const std::string& val, bool focused) {
-    const char* lc    = focused ? Colors::green_b : Colors::gray;
-    std::string caret = focused ? (std::string(Colors::bg_green) + " " + Colors::reset)
-                                : std::string();
+            const std::string& val, bool focused, int cursor,
+            const std::string& placeholder) {
+    const char* lc = focused ? Colors::green_b : Colors::gray;
 
     // Prefix occupies "label  ▸ " = 7 (padded label) + " ▸ " (3 cols) = 10 cols.
     constexpr int prefix_w = 10;
     int avail = std::max(0, w - prefix_w);
 
     std::string body;
-    if (val.empty()) {
-        if (focused) {
-            body = caret;
-        } else {
-            std::string ph = "(optional)";
+    int         cur_off = -1;     // cursor's display column within the body
+    std::string cur_ch  = " ";    // character the block cursor sits on
+
+    if (!focused) {
+        if (val.empty()) {
+            std::string ph = placeholder;
             if ((int)ph.size() > avail)
                 ph = avail > 0 ? ph.substr(0, avail - 1) + "…" : std::string();
             body.append(Colors::dgray).append(ph).append(Colors::reset);
+        } else {
+            std::string shown = val;
+            if ((int)shown.size() > avail)
+                shown = avail > 0 ? shown.substr(0, avail - 1) + "…" : std::string();
+            body.append(Colors::yellow).append(shown).append(Colors::reset);
         }
-    } else if (focused) {
-        // Reserve a column for the caret and scroll-window the value so the
-        // cursor stays visible while typing past the right edge.
-        int val_w = std::max(0, avail - 1);
-        std::string shown = (int)val.size() > val_w
-                              ? val.substr(val.size() - val_w)
-                              : val;
-        body = highlight(shown) + caret;
     } else {
-        std::string shown = val;
-        if ((int)shown.size() > avail)
-            shown = avail > 0 ? shown.substr(0, avail - 1) + "…" : std::string();
-        body.append(Colors::yellow).append(shown).append(Colors::reset);
+        // Scroll-window the value so the cursor stays visible, then overlay a
+        // reverse-video block over the char at `cursor` (mirrors the shell's
+        // render_block_cursor so the cursor can sit mid-string).
+        if (cursor < 0)              cursor = (int)val.size();
+        if (cursor > (int)val.size()) cursor = (int)val.size();
+        int off = 0;
+        if (avail > 0 && cursor >= avail) off = cursor - avail + 1;
+        std::string shown = val.substr(std::min((size_t)off, val.size()),
+                                       (size_t)avail);
+        body    = shown.empty() ? std::string() : highlight(shown);
+        cur_off = cursor - off;
+        cur_ch  = cursor < (int)val.size() ? val.substr(cursor, 1) : " ";
     }
 
     char lab[16];
@@ -378,6 +476,13 @@ void qfield(int x, int y, int w, const std::string& label,
     std::string out;
     out.append(lc).append(lab).append(" ▸ ").append(Colors::reset).append(body);
     line(x, y, out);
+
+    if (focused && cur_off >= 0 && cur_off <= avail) {
+        std::string blk;
+        blk.append(Colors::reset).append(Colors::reverse).append(Colors::bold)
+           .append(cur_ch).append(Colors::reset);
+        line(x + prefix_w + cur_off, y, blk);
+    }
 }
 
 } // namespace term
